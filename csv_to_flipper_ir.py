@@ -5,9 +5,9 @@ import pandas as pd
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QLineEdit, QPushButton, QProgressBar, QPlainTextEdit,
-    QFileDialog, QMessageBox, QGroupBox
+    QFileDialog, QMessageBox, QGroupBox, QCheckBox
 )
-from PyQt6.QtCore import Qt, QThread, pyqtSignal, QObject
+from PyQt6.QtCore import Qt, QThread, pyqtSignal, QObject, QSettings
 from PyQt6.QtGui import QFont, QIcon, QPalette, QColor
 
 # --- Dark Theme Stylesheet ---
@@ -78,6 +78,14 @@ QPushButton#PrimaryButton:pressed {
     background-color: #c76e03;
     border-color: #c76e03;
 }
+QPushButton#CancelButton {
+    background-color: #cc0000;
+    border: 1px solid #cc0000;
+    color: #fff;
+}
+QPushButton#CancelButton:hover {
+    background-color: #ff0000;
+}
 QPushButton:disabled {
     background-color: #333;
     border-color: #444;
@@ -113,7 +121,56 @@ QLabel#SubHeaderLabel {
     color: #aaa;
     margin-bottom: 20px;
 }
+QCheckBox {
+    spacing: 10px;
+}
+QCheckBox::indicator {
+    width: 18px;
+    height: 18px;
+}
 """
+
+class IRProtocolConverter:
+    """Handles logic for various IR protocols."""
+    
+    @staticmethod
+    def convert(protocol, device, subdevice, function):
+        try:
+            p = protocol.upper()
+            d = int(device)
+            s = int(subdevice)
+            f = int(function)
+
+            if p == "NEC":
+                # NEC: address is dev(8bit) + sub(8bit), command is func(8bit) + ~func(8bit)
+                addr_hex = f"{d:02X} {s:02X} 00 00"
+                cmd_hex = f"{f:02X} {(~f & 0xFF):02X} 00 00"
+                return addr_hex, cmd_hex
+            
+            elif p == "SAMSUNG":
+                # Samsung: 32-bit protocol, address often dev + sub
+                addr_hex = f"{d:02X} {s:02X} 00 00"
+                cmd_hex = f"{f:02X} 00 00 00"
+                return addr_hex, cmd_hex
+            
+            elif p == "SONY":
+                # Sony: 12, 15, or 20 bits. Usually address is device.
+                addr_hex = f"{d:02X} 00 00 00"
+                cmd_hex = f"{f:02X} 00 00 00"
+                return addr_hex, cmd_hex
+            
+            elif p in ["RC5", "RC6"]:
+                addr_hex = f"{d:02X} 00 00 00"
+                cmd_hex = f"{f:02X} 00 00 00"
+                return addr_hex, cmd_hex
+            
+            else:
+                # Fallback for others (HEX)
+                addr_hex = f"{d:04X} {s:04X}" if s != 0 else f"{d:04X} 00 00"
+                cmd_hex = f"{f:04X} 00 00"
+                return addr_hex, cmd_hex
+        except:
+            return "00 00 00 00", "00 00 00 00"
 
 class IRConverterWorker(QObject):
     finished = pyqtSignal()
@@ -121,27 +178,15 @@ class IRConverterWorker(QObject):
     log = pyqtSignal(str)
     error = pyqtSignal(str)
 
-    def __init__(self, input_dir, output_dir):
+    def __init__(self, input_dir, output_dir, group_by_csv=False):
         super().__init__()
         self.input_dir = input_dir
         self.output_dir = output_dir
+        self.group_by_csv = group_by_csv
+        self.is_cancelled = False
 
-    def convert_nec_command(self, function_val):
-        try:
-            val = int(function_val)
-            cmd_hex = f"{val:02X}"
-            inv_hex = f"{(~val & 0xFF):02X}"
-            return f"{cmd_hex} {inv_hex} 00 00"
-        except:
-            return "00 00 00 00"
-
-    def convert_address(self, device, subdevice):
-        try:
-            dev_hex = f"{int(device):02X}"
-            sub_hex = f"{int(subdevice):02X}"
-            return f"{dev_hex} {sub_hex} 00 00"
-        except:
-            return "00 00 00 00"
+    def stop(self):
+        self.is_cancelled = True
 
     def run(self):
         csv_files = glob.glob(os.path.join(self.input_dir, "*.csv"))
@@ -152,6 +197,10 @@ class IRConverterWorker(QObject):
 
         try:
             for i, csv_file in enumerate(csv_files):
+                if self.is_cancelled:
+                    self.log.emit("!! Process cancelled by user.")
+                    break
+
                 filename = os.path.basename(csv_file)
                 self.log.emit(f"> Reading: {filename}...")
                 
@@ -166,30 +215,47 @@ class IRConverterWorker(QObject):
                     self.log.emit(f"! Skipping {filename}: Missing required columns.")
                     continue
 
-                for _, row in df.iterrows():
-                    func_name = str(row['functionname']).strip().replace('/', '_').replace('\\', '_')
-                    protocol = str(row['protocol'])
+                if self.group_by_csv:
+                    # Single remote file mode
+                    remote_name = os.path.splitext(filename)[0]
+                    remote_content = "Filetype: IR signals file\nVersion: 1\n"
                     
-                    address_str = self.convert_address(row['device'], row['subdevice'])
+                    for _, row in df.iterrows():
+                        func_name = str(row['functionname']).strip().replace('/', '_').replace('\\', '_')
+                        protocol = str(row['protocol'])
+                        addr, cmd = IRProtocolConverter.convert(protocol, row['device'], row['subdevice'], row['function'])
+                        
+                        remote_content += (
+                            f"# \nname: {func_name}\n"
+                            "type: parsed\n"
+                            f"protocol: {protocol}\n"
+                            f"address: {addr}\n"
+                            f"command: {cmd}\n"
+                        )
                     
-                    if protocol.upper() == "NEC":
-                        command_str = self.convert_nec_command(row['function'])
-                    else:
-                        command_str = f"{int(row['function']):04X} 00 00"
-
-                    ir_content = (
-                        "Filetype: IR signals file\n"
-                        "Version: 1\n"
-                        f"name: {func_name}\n"
-                        "type: parsed\n"
-                        f"protocol: {protocol}\n"
-                        f"address: {address_str}\n"
-                        f"command: {command_str}\n"
-                    )
-
-                    file_path = os.path.join(self.output_dir, f"{func_name}.ir")
+                    file_path = os.path.join(self.output_dir, f"{remote_name}.ir")
                     with open(file_path, 'w') as f:
-                        f.write(ir_content)
+                        f.write(remote_content)
+                else:
+                    # Individual files mode
+                    for _, row in df.iterrows():
+                        func_name = str(row['functionname']).strip().replace('/', '_').replace('\\', '_')
+                        protocol = str(row['protocol'])
+                        addr, cmd = IRProtocolConverter.convert(protocol, row['device'], row['subdevice'], row['function'])
+                        
+                        ir_content = (
+                            "Filetype: IR signals file\n"
+                            "Version: 1\n"
+                            f"name: {func_name}\n"
+                            "type: parsed\n"
+                            f"protocol: {protocol}\n"
+                            f"address: {addr}\n"
+                            f"command: {cmd}\n"
+                        )
+
+                        file_path = os.path.join(self.output_dir, f"{func_name}.ir")
+                        with open(file_path, 'w') as f:
+                            f.write(ir_content)
                 
                 self.log.emit(f"✓ Processed {filename}")
                 self.progress.emit(i + 1)
@@ -203,12 +269,16 @@ class IRConverterApp(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Flipper Zero IR Converter")
-        self.resize(800, 600)
+        self.resize(800, 700)
+        self.setAcceptDrops(True)
+        
+        self.settings = QSettings("Exzploit", "FlipperIRConverter")
         
         # Apply Dark Theme
         self.setStyleSheet(FLIPPER_THEME)
         
         self.setup_ui()
+        self.load_settings()
 
     def setup_ui(self):
         central_widget = QWidget()
@@ -242,7 +312,7 @@ class IRConverterApp(QMainWindow):
         # Input Row
         input_layout = QHBoxLayout()
         self.input_entry = QLineEdit()
-        self.input_entry.setPlaceholderText("Select Input Folder (containing .csv files)...")
+        self.input_entry.setPlaceholderText("Select Input Folder (or drag & drop here)...")
         browse_input_btn = QPushButton("Browse...")
         browse_input_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         browse_input_btn.clicked.connect(self.browse_input)
@@ -264,6 +334,10 @@ class IRConverterApp(QMainWindow):
         output_layout.addWidget(self.output_entry)
         output_layout.addWidget(browse_output_btn)
         config_layout.addLayout(output_layout)
+
+        # Options Row
+        self.group_checkbox = QCheckBox("Group signals from each CSV into a single .ir remote file")
+        config_layout.addWidget(self.group_checkbox)
 
         main_layout.addWidget(config_group)
 
@@ -302,14 +376,46 @@ class IRConverterApp(QMainWindow):
         self.start_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.start_btn.clicked.connect(self.run_conversion)
         
+        self.cancel_btn = QPushButton("CANCEL")
+        self.cancel_btn.setObjectName("CancelButton")
+        self.cancel_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.cancel_btn.clicked.connect(self.cancel_conversion)
+        self.cancel_btn.setVisible(False)
+        
         footer_layout.addWidget(self.start_btn)
+        footer_layout.addWidget(self.cancel_btn)
         footer_layout.addStretch()
         
         main_layout.addLayout(footer_layout)
 
+    def load_settings(self):
+        self.input_entry.setText(self.settings.value("input_dir", ""))
+        self.output_entry.setText(self.settings.value("output_dir", ""))
+        self.group_checkbox.setChecked(self.settings.value("group_by_csv", "false") == "true")
+
+    def save_settings(self):
+        self.settings.setValue("input_dir", self.input_entry.text())
+        self.settings.setValue("output_dir", self.output_entry.text())
+        self.settings.setValue("group_by_csv", "true" if self.group_checkbox.isChecked() else "false")
+
+    # Drag & Drop Support
+    def dragEnterEvent(self, event):
+        if event.mimeData().hasUrls():
+            event.accept()
+        else:
+            event.ignore()
+
+    def dropEvent(self, event):
+        files = [u.toLocalFile() for u in event.mimeData().urls()]
+        if files:
+            path = files[0]
+            if os.path.isdir(path):
+                self.input_entry.setText(path)
+            elif os.path.isfile(path) and path.lower().endswith(".csv"):
+                self.input_entry.setText(os.path.dirname(path))
+
     def log(self, message):
         self.log_window.appendPlainText(message)
-        # Auto-scroll
         scrollbar = self.log_window.verticalScrollBar()
         scrollbar.setValue(scrollbar.maximum())
 
@@ -336,13 +442,18 @@ class IRConverterApp(QMainWindow):
             QMessageBox.warning(self, "No Files", "No CSV files found in the input folder.")
             return
 
+        self.save_settings()
+
         # Reset UI state
         self.start_btn.setEnabled(False)
-        self.start_btn.setText("PROCESSING...")
+        self.start_btn.setVisible(False)
+        self.cancel_btn.setVisible(True)
+        
         self.log_window.clear()
         self.log("--- Initialization ---")
         self.log(f"Input: {input_dir}")
         self.log(f"Output: {output_dir}")
+        self.log(f"Mode: {'Single Remote File' if self.group_checkbox.isChecked() else 'Individual Files'}")
         self.log(f"Found {len(csv_files)} files.")
         self.log("----------------------")
         
@@ -352,7 +463,7 @@ class IRConverterApp(QMainWindow):
 
         # Threading
         self.thread = QThread()
-        self.worker = IRConverterWorker(input_dir, output_dir)
+        self.worker = IRConverterWorker(input_dir, output_dir, self.group_checkbox.isChecked())
         self.worker.moveToThread(self.thread)
 
         self.thread.started.connect(self.worker.run)
@@ -367,13 +478,26 @@ class IRConverterApp(QMainWindow):
 
         self.thread.start()
 
+    def cancel_conversion(self):
+        if hasattr(self, 'worker'):
+            self.worker.stop()
+            self.cancel_btn.setEnabled(False)
+            self.cancel_btn.setText("CANCELLING...")
+
     def on_process_finished(self):
         self.start_btn.setEnabled(True)
-        self.start_btn.setText("START CONVERSION")
-        self.status_label.setText("Batch processing complete.")
-        self.log("----------------------")
-        self.log("✓ All tasks completed successfully.")
-        QMessageBox.information(self, "Success", "Conversion process completed!")
+        self.start_btn.setVisible(True)
+        self.cancel_btn.setVisible(False)
+        self.cancel_btn.setEnabled(True)
+        self.cancel_btn.setText("CANCEL")
+        
+        if hasattr(self, 'worker') and self.worker.is_cancelled:
+            self.status_label.setText("Process cancelled.")
+        else:
+            self.status_label.setText("Batch processing complete.")
+            self.log("----------------------")
+            self.log("✓ All tasks completed successfully.")
+            QMessageBox.information(self, "Success", "Conversion process completed!")
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
